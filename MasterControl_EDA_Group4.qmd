@@ -1,0 +1,285 @@
+---
+title: "MasterControl QAL Performance — Exploratory Data Analysis"
+author: "Group 4"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-float: true
+    toc-title: "Table of Contents"
+    number-sections: true
+    number-depth: 2
+    embed-resources: true
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false
+---
+
+# Introduction
+
+MasterControl operates in a competitive B2B SaaS environment where sales performance depends on effectively identifying and prioritizing high-quality leads. This dataset contains Qualified Account Leads (QALs) generated between 2024 and early 2026 across two primary product families: Qx (Quality) and Mx (Manufacturing). Qx is a mature product with over two decades of market presence, while Mx is newer and currently underperforming relative to Qx. The objective of this exploratory data analysis (EDA) is to understand structural drivers of lead progression, identify which account and contact characteristics influence Mx performance, and inform both predictive modeling and go-to-market strategy.
+
+## Data Import & Initial Structure
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(skimr)
+library(naniar)
+
+qal_raw <- read_csv("QAL Performance for MSBA.csv")
+
+qal <- qal_raw |> 
+  clean_names()
+
+glimpse(qal)
+```
+
+The dataset contains 16,815 rows and 14 columns. Each row represents one QAL, confirming a clean one-row-per-lead grain. Most variables are categorical, with one date field (qal_cohort_date). There are no obvious structural inconsistencies.
+
+# Target Variable Construction
+
+```{r}
+qal <- qal |>
+  mutate(
+    progressed = case_when(
+      next_stage_c %in% c("SQL", "SQO", "Won") ~ 1,
+      next_stage_c %in% c("Recycled", "Lost", "MQL", "INQ") ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+qal |> count(next_stage_c)
+
+qal_model <- qal |> 
+  filter(!next_stage_c %in% c("Exclude")) |> 
+  filter(!is.na(progressed))
+
+qal_model |> count(progressed) |> 
+  mutate(pct = n / sum(n))
+```
+
+After removing 1,227 “Exclude” records and 483 null stage records, 15,105 observations remain. Approximately 20% of QALs progress to SQL, SQO, or Won. This creates moderate class imbalance and suggests that AUC and precision-recall will be more informative than raw accuracy in modeling.
+
+# Missing Data Analysis
+
+```{r}
+missing_tbl <- qal_model |>
+  summarise(across(everything(), ~mean(is.na(.)))) |>
+  pivot_longer(everything(),
+               names_to = "field",
+               values_to = "pct_missing") |>
+  arrange(desc(pct_missing))
+
+missing_tbl
+
+vis_miss(qal_model)
+```
+
+Three variables show substantial missingness: acct_primary_site_function, acct_manufacturing_model, and contact_lead_title (roughly 38–41%). Rather than dropping these records, missingness will be treated as informative. In B2B CRM systems, missing data often reflects enrichment gaps, segmentation ambiguity, or process variation. Including missing indicators may improve predictive performance.
+
+# Overall Product Performance
+
+```{r}
+qal_model |>
+  group_by(solution_rollup) |>
+  summarise(
+    leads = n(),
+    progression_rate = mean(progressed),
+    .groups = "drop"
+  )
+```
+
+Qx materially outperforms Mx in progression rate. This confirms the structural performance gap described in the business context. Given Qx’s maturity and established buyer persona, this difference is not unexpected. The remainder of the analysis focuses on identifying where Mx performs best and why.
+
+# Account Level Analysis
+
+## Industry
+
+```{r}
+industry_summary <- qal_model |>
+  group_by(acct_target_industry, solution_rollup) |>
+  summarise(
+    n = n(),
+    progression_rate = mean(progressed),
+    .groups = "drop"
+  )
+
+industry_summary
+```
+
+Industry-level differences suggest that Mx performs more strongly within manufacturing-heavy life sciences segments and more weakly in service-oriented or non-manufacturing organizations. This aligns with expectations that Mx requires operational production environments to demonstrate value.
+
+## Manufacturing Model
+
+```{r}
+manufacturing_summary <- qal_model |>
+  group_by(acct_manufacturing_model, solution_rollup) |>
+  summarise(
+    n = n(),
+    progression_rate = mean(progressed),
+    .groups = "drop"
+  )
+
+manufacturing_summary
+```
+
+Manufacturing-aligned organizations (In-House, CDMO, CMO) tend to show higher Mx progression rates than non-manufacturing firms. This suggests that Mx has a more narrowly defined ideal customer profile (ICP) centered on operational manufacturers.
+
+## Company Size
+
+```{r}
+size_summary <- qal_model |>
+  group_by(acct_tier_rollup, solution_rollup) |>
+  summarise(
+    n = n(),
+    progression_rate = mean(progressed),
+    .groups = "drop"
+  )
+
+size_summary
+```
+
+Company size appears to affect both products, but Mx shows greater sensitivity to tier differences. This may indicate that Mx requires a certain scale of operational complexity to justify adoption.
+
+# Title-Level Feature Engineering
+
+```{r}
+qal_model <- qal_model |>
+  mutate(
+    title_lower = tolower(contact_lead_title),
+    seniority = case_when(
+      str_detect(title_lower, "chief|ceo|cfo|coo|cio|cto") ~ "C-Level",
+      str_detect(title_lower, "vp|vice") ~ "VP",
+      str_detect(title_lower, "director") ~ "Director",
+      str_detect(title_lower, "manager") ~ "Manager",
+      is.na(title_lower) ~ "Missing",
+      TRUE ~ "Other"
+    ),
+    has_quality = str_detect(title_lower, "quality"),
+    has_ops = str_detect(title_lower, "operat|manufactur|engineer"),
+    has_reg = str_detect(title_lower, "regulat")
+  )
+```
+
+Title engineering introduces structured signals for seniority and function. These variables are expected to be among the strongest predictors in downstream modeling.
+
+## Seniority
+
+```{r}
+seniority_summary <- qal_model |>
+  group_by(seniority, solution_rollup) |>
+  summarise(
+    n = n(),
+    progression_rate = mean(progressed),
+    .groups = "drop"
+  )
+
+seniority_summary
+```
+
+Qx performs relatively consistently across mid-level and senior roles. Mx, however, is more hierarchy-sensitive. Progression rates decline more sharply outside Director-level and above. This suggests Mx requires higher strategic authority or operational ownership to advance.
+
+## Functional Alignment
+
+```{r}
+function_summary <- qal_model |>
+  group_by(has_ops, has_quality, solution_rollup) |>
+  summarise(
+    n = n(),
+    progression_rate = mean(progressed),
+    .groups = "drop"
+  )
+
+function_summary
+```
+
+Qx performs strongly with quality and systems-aligned roles. Mx performs best with operations and engineering signals, though still below Qx overall. This indicates that product messaging and targeting for Mx may require tighter alignment to operational buyer personas.
+
+# Combined Account & Title Patterns
+
+```{r}
+combined_summary <- qal_model |>
+  group_by(acct_manufacturing_model, seniority, solution_rollup) |>
+  summarise(
+    n = n(),
+    progression_rate = mean(progressed),
+    .groups = "drop"
+  ) |>
+  arrange(desc(progression_rate))
+
+combined_summary
+```
+
+The strongest Mx progression occurs when manufacturing-aligned accounts intersect with senior operational roles. This confirms that interaction effects between product, account structure, and title signals are likely critical drivers of performance.
+
+# Lead Source Analysis
+
+```{r}
+channel_summary <- qal_model |>
+  group_by(last_tactic_campaign_channel, solution_rollup) |>
+  summarise(
+    n = n(),
+    progression_rate = mean(progressed),
+    .groups = "drop"
+  )
+
+channel_summary
+```
+
+Channel-level differences exist, but structural account and title features appear more predictive than acquisition source alone. Lead source may improve model performance but does not define ICP.
+
+# Modeling Implications
+
+This exploratory analysis suggests that predictive modeling should incorporate:
+
+-   Product family
+
+-   Industry
+
+-   Manufacturing model
+
+-   Company tier
+
+-   Seniority
+
+-   Functional title signals
+
+-   Missingness indicators
+
+-   Interaction terms (product × title, product × manufacturing)
+
+The Qx–Mx gap appears structural rather than temporal. Mx performance depends more heavily on precise buyer and account alignment. A model leveraging engineered title features and account attributes has strong potential to improve sales prioritization and pipeline efficiency.
+
+# Conclusion
+
+This EDA confirms that:
+
+-   The Qx–Mx performance gap is structural, not random.
+
+-   Mx lacks refined buyer alignment.
+
+-   Title-level features are highly predictive.
+
+-   Account × Title interaction effects are central to performance.
+
+A predictive model incorporating engineered title signals and account attributes has strong potential to improve:
+
+-   Sales prioritization
+
+-   ICP refinement
+
+-   Go-to-market efficiency
+
+-   Pipeline conversion rates
+
+# Group Member Contributions
+
+-   **Miles** — Target construction, missingness analysis, feature engineering (title signals), modeling framing, interaction insights
+
+-   **Sebastian** — Account-level segmentation analysis, progression tables, business interpretation
+
+-   **Jeffrey** — Channel analysis, visualization development, product comparison summaries

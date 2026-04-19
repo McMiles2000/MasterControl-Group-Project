@@ -1,0 +1,1252 @@
+---
+title: "Group Modeling MasterControl"
+author: "Miles McCunniff, Sebastian Perez, Jeffrey Zhang"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-float: true
+    toc-title: "Table of Contents"
+    number-sections: true
+    number-depth: 2
+    embed-resources: true
+execute:
+  include: true
+  eval: true    
+  warning: false
+  message: false
+---
+
+# Introduction
+
+MasterControl operates in a competitive B2B software environment where efficient lead prioritization is critical to sales performance. The company generates a substantial volume of qualified account leads (QALs), but not all leads progress meaningfully through the pipeline. Because sales time and attention are limited, MasterControl needs a more data-driven way to identify which leads are most likely to advance. The objective of this modeling analysis is to develop a predictive model that can distinguish between QALs that are likely to reach an advanced sales stage and those that are not. While final closed-won outcomes are the most desirable result, the updated dataset contains relatively few won observations. To create a more stable and practically useful model, success is defined as progression to an advanced downstream stage, specifically SQL, SQO, or Won. The resulting model is intended to support lead prioritization and improve pipeline efficiency.
+
+## Business Problem
+
+MasterControl wants to improve sales efficiency by understanding which QALs are most likely to progress successfully through the pipeline. The company is especially interested in improving decision-making around lead prioritization and follow-up so that sales resources are focused on the opportunities with the highest expected value.
+
+## Analytic Problem
+
+Use historical QAL-level data to build a predictive model that classifies whether a lead is likely to reach a meaningful downstream sales stage. The model should outperform a benchmark, provide interpretable performance metrics, and generate insights that can support business prioritization.
+
+## Modeling Approach
+
+The objective of this modeling phase is to predict whether a qualified sales lead (QAL) will successfully progress through the sales pipeline for MasterControl’s Manufacturing (Mx) product line. This is formulated as a binary classification problem, where the target variable indicates whether a lead progresses or does not progress.
+
+To address this problem, we implement a structured modeling pipeline using the tidymodels frameworkin R. This approach allows for consistent preprocessing, model training, and evaluation across multiple algorithms. Given the complexity of B2B sales processes and the potential for nonlinear relationships between lead attributes and outcomes, we evaluate a range of models including:
+
+-   Logistic Regression (baseline model)
+
+-   LASSO (regularized regression)
+
+-   Decision Tree
+
+-   Random Forest
+
+-   Gradient Boosting (XGBoost)
+
+Model performance is evaluated using cross-validated ROC AUC as the primary metric, as it captures the model’s ability to distinguish between progressing and non-progressing leads across all classification thresholds.
+
+From a business perspective, the goal is not only to maximize predictive performance but also to generate actionable insights that enable MasterControl’s sales team to prioritize high-value opportunities, improve conversion rates, and allocate resources more effectively within the Mx pipeline.
+
+# Data Preparation & Cleaning
+
+Prior to model development, the dataset was prepared to ensure consistency, relevance, and suitability for predictive modeling. The data consists of qualified sales leads (QALs) associated with MasterControl’s Manufacturing (Mx) product line, along with attributes related to accounts, contacts, and opportunity characteristics.
+
+The target variable was defined as whether a lead successfully progressed through the sales pipeline. This binary outcome serves as the basis for the classification models developed in the subsequent section.
+
+Several preprocessing steps were applied to prepare the data for modeling. First, irrelevant or redundant variables that did not contribute meaningful predictive value were removed. These included identifiers and fields with excessive missingness or no variability. Additionally, categorical variables were reviewed to ensure consistent labeling and to reduce fragmentation across similar categories.
+
+Missing data was assessed across key variables, as exploratory analysis indicated that missingness itself may carry meaningful signal in a sales context (e.g., incomplete account or contact information). Rather than removing all incomplete observations, missingness is handled strategically within the modeling pipeline to preserve potential predictive value.
+
+Finally, the dataset was structured to include a consistent set of predictors across all observations, ensuring compatibility with the modeling workflow and enabling fair comparison across different algorithms.
+
+```{r}
+# Load required libraries for data preparation and modeling
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(tidymodels)
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Import raw QAL data
+qal_raw <- read_csv("Mastercontrol QAL Performance.csv")
+
+# Standardize column names to snake_case for easier modeling workflow
+qal <- qal_raw |>
+  clean_names()
+
+# Inspect structure of the cleaned dataset
+glimpse(qal)
+```
+
+The raw dataset is first imported and standardized using clean_names() so that variable names are consistent and easier to reference throughout the analysis.
+
+## Define the Modeling Target
+
+To support a more stable and business-relevant classification problem, success is defined as progression to an advanced downstream sales stage. Specifically, leads that reached **SQL**, **SQO**, or **Won** are coded as progressed, while earlier or unsuccessful outcomes are coded as non-progressed.
+
+```{r}
+# Create binary outcome variable based on downstream pipeline progression
+qal <- qal %>%
+  mutate(
+    progressed = case_when(
+      next_stage_c %in% c("SQL", "SQO", "Won") ~ "yes",
+      next_stage_c %in% c("Recycled", "Lost", "MQL", "INQ") ~ "no",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Keep only observations with usable target values
+qal_model <- qal %>%
+  filter(!is.na(progressed)) %>%
+  mutate(progressed = factor(progressed, levels = c("no", "yes")))
+
+# Review target distribution
+table(qal_model$progressed)
+prop.table(table(qal_model$progressed))
+```
+
+This target definition is more practical than modeling only closed-won deals, since won outcomes are relatively rare. From a MasterControl perspective, identifying leads that meaningfully advance through the pipeline is more useful for prioritizing sales effort than focusing only on final wins.
+
+## Engineer Predictor Variables
+
+In addition to the original account and campaign fields, we create structured features from the contact title field. These engineered variables capture whether the lead appears to be a senior decision-maker or aligned with key business functions such as quality, operations, manufacturing, engineering, or regulatory work.
+
+```{r}
+# Create engineered features from contact title
+qal_model <- qal_model %>%
+  mutate(
+    title_lower = tolower(contact_lead_title),
+    seniority = case_when(
+      str_detect(title_lower, "chief|ceo|cfo|coo|cio|cto") ~ "C-Level",
+      str_detect(title_lower, "vp|vice president") ~ "VP",
+      str_detect(title_lower, "director") ~ "Director",
+      str_detect(title_lower, "manager") ~ "Manager",
+      is.na(title_lower) ~ NA_character_,
+      TRUE ~ "Other"
+    ),
+    has_quality = as.integer(str_detect(title_lower, "quality")),
+    has_ops     = as.integer(str_detect(title_lower, "operat|manufactur|engineer")),
+    has_reg     = as.integer(str_detect(title_lower, "regulat"))
+  )
+```
+
+## Select Final Modeling Variables
+
+The final modeling dataset focuses on a manageable set of variables that are both business-relevant and available at the lead level. These predictors include account attributes, solution and territory fields, campaign information, and engineered contact-level indicators.
+
+```{r}
+# Select variables for modeling
+qal_model <- qal_model %>%
+  select(
+    progressed,
+    acct_primary_site_function,
+    acct_manufacturing_model,
+    acct_target_industry,
+    acct_territory_rollup,
+    acct_tier_rollup,
+    solution_rollup,
+    last_tactic_campaign_channel,
+    contact_lead_title,
+    seniority,
+    has_quality,
+    has_ops,
+    has_reg
+  )
+
+# Inspect modeling dataset
+glimpse(qal_model)
+```
+
+# Modeling
+
+## Prepare Data for Modeling
+
+To fit multiple classification models consistently, the modeling dataset must be converted into a fully numeric format. Because many predictors are categorical, we use model.matrix() to create dummy variables. Before doing so, we explicitly preserve missingness as signal by creating indicator columns for variables with missing values. The original missing values are then imputed so the models can run successfully.
+
+```{r}
+# Create numeric target variable for modeling
+qal_model <- qal_model %>%
+  mutate(progressed_num = ifelse(progressed == "yes", 1, 0))
+
+# Remove raw text field before modeling
+model_df <- qal_model %>%
+  select(-contact_lead_title)
+
+# Identify columns with missing values
+na_cols <- names(model_df)[colSums(is.na(model_df)) > 0]
+
+# Create missingness indicator variables
+for (col in na_cols) {
+  model_df[[paste0("na_", col)]] <- ifelse(is.na(model_df[[col]]), 1, 0)
+}
+
+# Impute missing values so models can run
+# Numeric variables -> median
+# Character variables -> "Unknown"
+# Factor variables -> add "Unknown" level
+model_df <- model_df %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
+  mutate(across(where(is.character), ~ ifelse(is.na(.), "Unknown", .))) %>%
+  mutate(across(where(is.factor), ~ forcats::fct_explicit_na(., na_level = "Unknown")))
+
+# Convert predictors to numeric matrix using dummy encoding
+x <- model.matrix(progressed_num ~ . - progressed, data = model_df)[, -1]
+
+# Define outcome variable
+y <- model_df$progressed_num
+
+# Confirm model inputs are ready
+dim(x)
+length(y)
+sum(is.na(x))
+sum(is.na(y))
+```
+
+## Split Data into Training and Test Sets
+
+To evaluate model performance on unseen data, the full dataset is split into training and testing subsets. The training set is used to fit the models, while the test set is held out for final evaluation.
+
+```{r}
+# Create 80/20 train-test split
+set.seed(123)
+
+train_index <- sample(1:nrow(x), size = 0.8 * nrow(x))
+
+x_train <- x[train_index, ]
+x_test  <- x[-train_index, ]
+
+y_train <- y[train_index]
+y_test  <- y[-train_index]
+
+# Check split sizes
+dim(x_train)
+dim(x_test)
+length(y_train)
+length(y_test)
+```
+
+## Logistic Regression
+
+We begin with logistic regression as a baseline classification model. Logistic regression is straightforward to interpret and provides a useful benchmark for understanding how predictor variables relate to the probability of lead progression.
+
+```{r}
+# Convert training matrix to data frame for logistic regression
+train_glm <- as.data.frame(x_train)
+train_glm$progressed_num <- y_train
+
+# Fit baseline logistic regression model
+glm_model <- glm(progressed_num ~ ., data = train_glm, family = "binomial")
+```
+
+```{r}
+# Generate predicted probabilities on test set
+glm_probs <- predict(glm_model, newdata = as.data.frame(x_test), type = "response")
+
+# Convert probabilities to class predictions
+glm_pred <- ifelse(glm_probs > 0.5, 1, 0)
+
+# Confusion matrix
+table(Predicted = glm_pred, Actual = y_test)
+```
+
+```{r}
+# Evaluate logistic regression with ROC AUC
+library(pROC)
+
+glm_roc <- roc(y_test, glm_probs)
+auc(glm_roc)
+plot(glm_roc, main = "Logistic Regression ROC Curve")
+```
+
+### Results
+
+The logistic regression model achieved an ROC AUC of 0.7821 on the holdout test set. This indicates that the model has a meaningful ability to distinguish between leads that progress and those that do not, while still remaining highly interpretable.
+
+As the baseline model, logistic regression is useful because it shows how much predictive signal can be captured using a relatively simple linear relationship between the predictors and the probability of progression. In the MasterControl context, this is valuable because it provides a transparent starting point for understanding how account characteristics, campaign fields, and contact-level features relate to movement through the Mx sales pipeline.
+
+The confusion matrix also helps show how the model performs at the default 0.5 classification threshold. Even if logistic regression is not ultimately the top-performing model, it serves as an important benchmark for evaluating whether more complex models provide enough additional lift to justify their added complexity.
+
+## LASSO
+
+LASSO extends logistic regression by applying regularization, which shrinks weaker coefficients toward zero. This is especially useful when dummy encoding creates a larger set of predictors and when some features may be noisy or redundant.
+
+```{r}
+# Fit cross-validated LASSO model
+library(glmnet)
+
+set.seed(123)
+lasso_cv <- cv.glmnet(
+  x_train,
+  y_train,
+  family = "binomial",
+  alpha = 1
+)
+
+# Plot cross-validation results
+plot(lasso_cv)
+
+# Extract best lambda value
+best_lambda <- lasso_cv$lambda.min
+best_lambda
+```
+
+```{r}
+# Fit final LASSO model using selected lambda
+lasso_model <- glmnet(
+  x_train,
+  y_train,
+  family = "binomial",
+  alpha = 1,
+  lambda = best_lambda
+)
+
+# Predict probabilities on test set
+lasso_probs <- predict(lasso_model, newx = x_test, type = "response")
+lasso_probs <- as.numeric(lasso_probs)
+
+# Convert probabilities to class predictions
+lasso_pred <- ifelse(lasso_probs > 0.5, 1, 0)
+
+# Confusion matrix
+table(Predicted = lasso_pred, Actual = y_test)
+```
+
+```{r}
+# Evaluate LASSO with ROC AUC
+lasso_roc <- roc(y_test, lasso_probs)
+auc(lasso_roc)
+plot(lasso_roc, main = "LASSO ROC Curve")
+```
+
+### Results
+
+The LASSO model achieved an ROC AUC of 0.7867 on the holdout test set. Compared with standard logistic regression, LASSO introduces regularization, which helps control overfitting and shrinks weaker coefficients toward zero.
+
+This is particularly useful in the MasterControl dataset because converting multiple categorical fields into dummy variables creates a fairly wide set of predictors. LASSO helps identify which of those variables carry the strongest signal while reducing the influence of noisier or less informative features. That makes it attractive not only as a predictive model, but also as a way to surface which lead characteristics matter most.
+
+From a business standpoint, strong LASSO performance would suggest that lead progression is driven by a relatively concentrated set of important signals rather than requiring highly complex interactions. That is often desirable because it supports both prediction and interpretability.
+
+## Random Forest
+
+Random Forest is a more flexible, non-linear model that can capture interactions and complex relationships among predictors. This is useful in a B2B sales setting where lead progression may depend on combinations of attributes rather than simple one-variable effects.
+
+```{r}
+# Fit random forest classification model
+library(randomForest)
+
+y_train_factor <- as.factor(y_train)
+y_test_factor  <- as.factor(y_test)
+
+set.seed(123)
+rf_model <- randomForest(
+  x = x_train,
+  y = y_train_factor,
+  ntree = 300,
+  importance = TRUE
+)
+
+# Print model summary
+print(rf_model)
+```
+
+```{r}
+# Predict probabilities and classes on test set
+rf_probs <- predict(rf_model, newdata = x_test, type = "prob")[, 2]
+rf_pred  <- predict(rf_model, newdata = x_test, type = "response")
+
+# Confusion matrix
+table(Predicted = rf_pred, Actual = y_test_factor)
+```
+
+```{r}
+# Evaluate Random Forest with ROC AUC
+rf_roc <- roc(y_test, rf_probs)
+auc(rf_roc)
+plot(rf_roc, main = "Random Forest ROC Curve")
+```
+
+```{r}
+# Plot variable importance
+varImpPlot(rf_model)
+```
+
+### Results
+
+The Random Forest model achieved an ROC AUC of 0.7641 on the holdout test set. Random Forest is able to capture non-linear relationships and interactions across predictors, which makes it well-suited for a B2B sales setting where progression may depend on combinations of account, contact, and engagement characteristics.
+
+If Random Forest performs better than the linear models, that suggests MasterControl’s lead progression process is influenced by more complex patterns that are not fully captured by logistic regression alone. In that case, the model may provide stronger ranking power for prioritizing high-potential leads, even if it is less directly interpretable than logistic regression or LASSO.
+
+The Random Forest variable importance results highlight that campaign channel, account characteristics, and solution alignment are the most influential factors in predicting lead progression. Marketing channels such as Email, External Demand Generation, and SEO rank among the top predictors, indicating that how a lead is sourced or engaged plays a significant role in downstream success. In addition, account-level attributes which include industry (e.g., Pharma & Biotech, Medical Device), account tier, and manufacturing model also contribute strongly, suggesting that certain types of companies are inherently better aligned with successful progression in the Mx pipeline. Engineered features such as has_quality and has_ops further reinforce that leads tied to relevant functional roles are more likely to advance.
+
+Another important finding is the contribution of missingness indicators (e.g., `na_has_ops`, `na_has_reg`, `na_seniority`), which confirms that incomplete CRM data itself carries predictive value. Missing information may reflect lower engagement, weaker qualification, or earlier-stage leads, all of which are associated with lower progression likelihood. Overall, these results suggest that lead progression is driven by a combination of marketing effectiveness, account fit, functional alignment, and data completeness. This provides MasterControl with actionable insight into how leads should be prioritized and evaluated within the Mx sales pipeline.
+
+## XGBoost
+
+Gradient Boosting (XGBoost) is an advanced ensemble method that builds trees sequentially, with each new tree correcting errors from the previous ones. This allows the model to capture complex, non-linear relationships in the data and often results in strong predictive performance. In the context of MasterControl’s sales pipeline, XGBoost can help identify more subtle interactions between account characteristics, contact attributes, and campaign engagement that may influence lead progression.
+
+```{r}
+library(xgboost)
+
+# Create DMatrix objects
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+dtest  <- xgb.DMatrix(data = x_test, label = y_test)
+
+# Train model
+set.seed(123)
+xgb_model <- xgb.train(
+  params = list(
+    objective = "binary:logistic",
+    eval_metric = "auc"
+  ),
+  data = dtrain,
+  nrounds = 100
+)
+```
+
+```{r}
+# Predict probabilities on test set
+xgb_probs <- predict(xgb_model, newdata = x_test)
+
+# Convert probabilities to class predictions
+xgb_pred <- ifelse(xgb_probs > 0.5, 1, 0)
+
+# Confusion matrix
+table(Predicted = xgb_pred, Actual = y_test)
+```
+
+```{r}
+# ROC AUC for XGBoost
+xgb_roc <- roc(y_test, xgb_probs)
+auc(xgb_roc)
+plot(xgb_roc, main = "XGBoost ROC Curve")
+```
+
+### Results
+
+The XGBoost model achieved an ROC AUC of 0.7814 on the holdout test set. Among the models considered, XGBoost represents the most flexible and complex approach, as it builds trees sequentially to improve prediction errors from prior iterations.
+
+This suggests that, in the MasterControl context, lead progression is not primarily driven by highly complex non-linear interactions. Instead, much of the predictive signal can be captured using simpler linear relationships between lead attributes and outcomes. Although XGBoost remains a strong benchmark model, the lack of a clear performance advantage indicates that increased model complexity does not provide meaningful additional value in this case.
+
+## Compare Model Performance
+
+To determine the strongest approach, the models are compared using ROC AUC on the held-out test set. ROC AUC is appropriate here because it measures how well each model separates progressing leads from non-progressing leads across all classification thresholds.
+
+```{r}
+# Compare AUC across all models
+model_results <- data.frame(
+  Model = c("Logistic Regression", "LASSO", "Random Forest", "XGBoost"),
+  AUC = c(
+    as.numeric(auc(glm_roc)),
+    as.numeric(auc(lasso_roc)),
+    as.numeric(auc(rf_roc)),
+    as.numeric(auc(xgb_roc))
+  )
+)
+
+# Sort from best to worst
+model_results <- model_results %>%
+  arrange(desc(AUC))
+
+model_results
+```
+
+# Results Summary and Final Recommendation
+
+The models were compared using ROC AUC on the held-out test set to evaluate their ability to distinguish between progressing and non-progressing leads. The top-performing model was LASSO, with an AUC of 0.7867, followed closely by logistic regression and XGBoost. Random Forest performed slightly worse, suggesting that additional model complexity did not translate into improved predictive performance.
+
+From a business perspective, these results are important because they indicate that lead progression within the Mx pipeline can be effectively predicted using a relatively simple and interpretable model. The fact that LASSO outperforms more complex models suggests that a focused set of key predictors, rather than highly complex interactions, drives most of the signal. This makes LASSO particularly well-suited for implementation, as it provides both strong predictive performance and clear insight into which variables matter most.
+
+Overall, the results demonstrate that MasterControl can use predictive modeling to meaningfully improve lead prioritization. By applying a model such as LASSO, sales teams can better identify high-potential leads, allocate resources more efficiently, and focus efforts on opportunities that are most likely to progress through the pipeline.
+
+## Group Member Contributions
+
+-   **Miles McCunniff:** Led the modeling workflow, including data preparation for modeling, implementation of logistic regression, LASSO, Random Forest, and XGBoost models, and development of the final model comparison and recommendation.
+
+-   **Jeffrey Zhang:** Contributed to exploratory data analysis, variable selection, and interpretation of model results, helping connect modeling outputs to the MasterControl business problem.
+
+-   **Sebastian Perez Parra:** Supported data preparation, feature engineering, and validation of modeling results, as well as contributing to interpretation and refinement of the final report.
+
+-   **All Group Members:** Collaborated on reviewing the final deliverable to ensure accuracy, clarity, and alignment with project objectives.
+
+
+# Extra Modeling Before Presentation
+
+## Decision Threshold Optimization
+
+While model performance is evaluated using ROC AUC, practical implementation requires selecting a classification threshold that determines which leads are prioritized by the sales team. The default threshold of 0.5 assumes equal cost for false positives and false negatives, which is not realistic in a sales context.
+
+For MasterControl, the cost of pursuing a low-quality lead (false positive) must be weighed against the value of successfully advancing a high-potential lead (true positive). Therefore, the optimal threshold should be selected based on business objectives rather than default statistical conventions.
+
+```{r}
+# Decision threshold analysis for the final LASSO model
+
+thresholds <- seq(0.10, 0.90, by = 0.05)
+
+threshold_results <- data.frame()
+
+for (t in thresholds) {
+  
+  # Convert predicted probabilities to class predictions at threshold t
+  preds <- ifelse(lasso_probs > t, 1, 0)
+  
+  # Force both classes to appear in the confusion matrix
+  cm <- table(
+    factor(preds, levels = c(0, 1)),
+    factor(y_test, levels = c(0, 1))
+  )
+  
+  # Extract confusion matrix values
+  TN <- cm["0", "0"]
+  FN <- cm["0", "1"]
+  FP <- cm["1", "0"]
+  TP <- cm["1", "1"]
+  
+  # Calculate performance metrics
+  sensitivity <- ifelse((TP + FN) == 0, NA, TP / (TP + FN))
+  specificity <- ifelse((TN + FP) == 0, NA, TN / (TN + FP))
+  precision   <- ifelse((TP + FP) == 0, NA, TP / (TP + FP))
+  accuracy    <- (TP + TN) / sum(cm)
+  
+  # Store results
+  threshold_results <- rbind(
+    threshold_results,
+    data.frame(
+      threshold = t,
+      sensitivity = sensitivity,
+      specificity = specificity,
+      precision = precision,
+      accuracy = accuracy,
+      true_positives = TP,
+      false_positives = FP,
+      true_negatives = TN,
+      false_negatives = FN
+    )
+  )
+}
+
+# View threshold results
+threshold_results
+```
+
+```{r}
+# Plot threshold tradeoffs
+library(ggplot2)
+
+ggplot(threshold_results, aes(x = threshold)) +
+  geom_line(aes(y = sensitivity, color = "Sensitivity"), linewidth = 1) +
+  geom_line(aes(y = specificity, color = "Specificity"), linewidth = 1) +
+  geom_line(aes(y = precision, color = "Precision"), linewidth = 1) +
+  labs(
+    title = "Decision Threshold Tradeoffs for Final LASSO Model",
+    x = "Classification Threshold",
+    y = "Metric Value",
+    color = "Metric"
+  ) +
+  theme_minimal()
+```
+
+## Decision Threshold Interpretation
+
+The threshold analysis shows a clear tradeoff between sensitivity and specificity. At lower thresholds, the model identifies a much larger share of progressing leads, but this comes at the cost of more false positives. At higher thresholds, the model becomes much more conservative, correctly filtering out non-progressing leads but missing a substantial portion of viable opportunities.
+
+For MasterControl, this suggests that the default threshold of 0.5 is likely too restrictive for lead prioritization, since it captures only a small share of progressing leads. A threshold closer to **0.25 to 0.30** appears more practical, as it provides a better balance between identifying likely progressing leads and limiting wasted sales effort. The final threshold should ultimately depend on business priorities, such as whether the goal is to maximize pipeline coverage or focus only on the highest-confidence leads.
+
+
+### Lift/Gains Style Chart
+
+```{r}
+# Create deciles based on predicted probability from LASSO
+lift_df <- data.frame(
+  actual = y_test,
+  score = lasso_probs
+) %>%
+  mutate(decile = ntile(desc(score), 10)) %>%
+  group_by(decile) %>%
+  summarise(
+    leads = n(),
+    progressed = sum(actual),
+    progression_rate = mean(actual)
+  ) %>%
+  ungroup()
+
+lift_df
+```
+
+```{r}
+# Plot progression rate by decile
+library(ggplot2)
+
+ggplot(lift_df, aes(x = factor(decile), y = progression_rate)) +
+  geom_col() +
+  labs(
+    title = "Lead Progression Rate by Predicted Score Decile",
+    x = "Score Decile (1 = Highest Predicted Probability)",
+    y = "Actual Progression Rate"
+  ) +
+  theme_minimal()
+```
+
+
+
+### Cumulative Gains/Capture Chart
+
+```{r}
+gains_df <- data.frame(
+  actual = y_test,
+  score = lasso_probs
+) %>%
+  arrange(desc(score)) %>%
+  mutate(
+    lead_rank = row_number(),
+    pct_leads = lead_rank / n(),
+    cumulative_progressed = cumsum(actual),
+    pct_progressed_captured = cumulative_progressed / sum(actual)
+  )
+
+ggplot(gains_df, aes(x = pct_leads, y = pct_progressed_captured)) +
+  geom_line(linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Cumulative Gains Chart for LASSO Model",
+    x = "Proportion of Leads Contacted",
+    y = "Proportion of Progressing Leads Captured"
+  ) +
+  theme_minimal()
+```
+
+### non-zero LASSO coefficients
+
+```{r}
+lasso_coef <- coef(lasso_model)
+lasso_coef_df <- data.frame(
+  term = rownames(as.matrix(lasso_coef)),
+  coefficient = as.numeric(lasso_coef)
+) %>%
+  filter(term != "(Intercept)", coefficient != 0) %>%
+  arrange(desc(abs(coefficient)))
+
+head(lasso_coef_df, 15)
+```
+
+```{r}
+top_lasso <- lasso_coef_df %>%
+  slice_max(order_by = abs(coefficient), n = 15)
+
+ggplot(top_lasso, aes(x = reorder(term, coefficient), y = coefficient)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top LASSO Predictors of Lead Progression",
+    x = "Predictor",
+    y = "Coefficient"
+  ) +
+  theme_minimal()
+```
+
+
+### Graphs
+
+```{r}
+library(scales)
+
+ggplot(gap_overall, aes(x = solution_rollup, y = rate, fill = solution_rollup)) +
+  geom_col() +
+  geom_text(
+    aes(label = percent(rate, accuracy = 0.1)),
+    vjust = -0.5,
+    size = 7
+  ) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Qx vs Mx Progression Rates",
+    x = "Product Line",
+    y = "Progression Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14)
+  )
+```
+
+```{r}
+ggplot(model_results, aes(x = reorder(Model, AUC), y = AUC, fill = Model)) +
+  geom_col() +
+  geom_text(
+    aes(label = round(AUC, 3)),
+    hjust = -0.2,
+    size = 7,
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  labs(
+    title = "Model Performance (AUC)",
+    x = "Model",
+    y = "AUC"
+  ) +
+  ylim(0, max(model_results$AUC) * 1.15) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14)
+  )
+```
+
+```{r}
+top_lasso <- lasso_coef_df %>%
+  slice_max(order_by = abs(coefficient), n = 10)
+
+ggplot(top_lasso, aes(x = reorder(term, coefficient), y = coefficient)) +
+  geom_col(fill = "#1AA6A6") +
+  geom_text(
+    aes(label = round(coefficient, 2)),
+    hjust = ifelse(top_lasso$coefficient > 0, -0.2, 1.2),
+    size = 6,
+    fontface = "bold"
+  ) +
+  coord_flip() +
+  labs(
+    title = "Top Drivers of Lead Progression",
+    x = "Predictor",
+    y = "Impact"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 13)
+  )
+```
+
+```{r}
+# Recreate row-level test dataset
+test_df <- model_df[-train_index, ]
+
+# Add predicted probabilities from LASSO
+test_scored <- test_df %>%
+  mutate(predicted_score = lasso_probs)
+
+# Flag top 20% of predicted leads
+cutoff <- quantile(test_scored$predicted_score, 0.80)
+
+top_leads <- test_scored %>%
+  filter(predicted_score >= cutoff)
+
+top_leads %>%
+  select(
+    predicted_score,
+    acct_target_industry,
+    acct_tier_rollup,
+    acct_primary_site_function,
+    acct_manufacturing_model,
+    seniority,
+    last_tactic_campaign_channel
+  ) %>%
+  arrange(desc(predicted_score)) %>%
+  head(15)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+lift_df <- data.frame(
+  actual = y_test,
+  score = lasso_probs
+) %>%
+  mutate(decile = ntile(desc(score), 10)) %>%
+  group_by(decile) %>%
+  summarise(rate = mean(actual), .groups = "drop")
+
+ggplot(lift_df, aes(x = factor(decile), y = rate)) +
+  geom_col(fill = "#1AA6A6") +
+  geom_text(
+    aes(label = percent(rate, accuracy = 0.1)),
+    vjust = -0.5,
+    size = 6,
+    fontface = "bold"
+  ) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Lead Quality by Model Score",
+    x = "Score Decile (1 = Highest Quality)",
+    y = "Progression Rate"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14)
+  )
+```
+
+```{r}
+ggplot(threshold_results, aes(x = threshold)) +
+  geom_line(aes(y = sensitivity, color = "Sensitivity"), linewidth = 1.5) +
+  geom_line(aes(y = specificity, color = "Specificity"), linewidth = 1.5) +
+  geom_line(aes(y = precision, color = "Precision"), linewidth = 1.5) +
+  labs(
+    title = "Decision Threshold Tradeoffs",
+    x = "Threshold",
+    y = "Metric Value",
+    color = "Metric"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 20, face = "bold"),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14)
+  )
+```
+
+```{r}
+# Confusion matrices for LASSO at selected decision thresholds
+
+selected_thresholds <- c(0.25, 0.30, 0.50)
+
+for (t in selected_thresholds) {
+  
+  preds <- ifelse(lasso_probs > t, 1, 0)
+  
+  cm <- table(
+    Predicted = factor(preds, levels = c(0, 1)),
+    Actual = factor(y_test, levels = c(0, 1))
+  )
+  
+  cat("\n")
+  cat("========================================\n")
+  cat("LASSO Confusion Matrix at Threshold =", t, "\n")
+  cat("========================================\n")
+  print(cm)
+  
+  TN <- cm["0", "0"]
+  FN <- cm["0", "1"]
+  FP <- cm["1", "0"]
+  TP <- cm["1", "1"]
+  
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  precision   <- ifelse((TP + FP) == 0, NA, TP / (TP + FP))
+  accuracy    <- (TP + TN) / sum(cm)
+  
+  cat("\nMetrics:\n")
+  cat("Sensitivity:", round(sensitivity, 3), "\n")
+  cat("Specificity:", round(specificity, 3), "\n")
+  cat("Precision:  ", round(precision, 3), "\n")
+  cat("Accuracy:   ", round(accuracy, 3), "\n")
+}
+```
+
+```{r}
+# Summary table for selected thresholds
+
+cm_summary <- data.frame()
+
+for (t in selected_thresholds) {
+  
+  preds <- ifelse(lasso_probs > t, 1, 0)
+  
+  cm <- table(
+    Predicted = factor(preds, levels = c(0, 1)),
+    Actual = factor(y_test, levels = c(0, 1))
+  )
+  
+  TN <- cm["0", "0"]
+  FN <- cm["0", "1"]
+  FP <- cm["1", "0"]
+  TP <- cm["1", "1"]
+  
+  cm_summary <- rbind(
+    cm_summary,
+    data.frame(
+      threshold = t,
+      TN = TN,
+      FP = FP,
+      FN = FN,
+      TP = TP,
+      sensitivity = round(TP / (TP + FN), 3),
+      specificity = round(TN / (TN + FP), 3),
+      precision = round(ifelse((TP + FP) == 0, NA, TP / (TP + FP)), 3),
+      accuracy = round((TP + TN) / sum(cm), 3)
+    )
+  )
+}
+
+cm_summary
+```
+
+
+```{r}
+library(tidyverse)
+library(scales)
+
+progression_by_solution <- qal %>%
+  filter(solution_rollup %in% c("Qx", "Mx")) %>%
+  group_by(solution_rollup) %>%
+  summarise(
+    n = n(),
+    progressed_n = sum(progressed == "yes", na.rm = TRUE),
+    progression_rate = progressed_n / n
+  ) %>%
+  ungroup()
+
+progression_by_solution
+```
+
+
+```{r}
+plot_df <- qal %>%
+  filter(solution_rollup %in% c("Qx", "Mx")) %>%
+  group_by(solution_rollup) %>%
+  summarise(
+    n = n(),
+    progressed_n = sum(progressed == "yes", na.rm = TRUE),
+    progression_rate = progressed_n / n
+  ) %>%
+  ungroup() %>%
+  mutate(solution_rollup = factor(solution_rollup, levels = c("Mx", "Qx")))
+
+ggplot(plot_df, aes(x = solution_rollup, y = progression_rate)) +
+  geom_col(width = 0.65, fill = "#2C7FB8") +
+  geom_text(
+    aes(label = percent(progression_rate, accuracy = 0.1)),
+    vjust = -0.6,
+    size = 5
+  ) +
+  geom_text(
+    aes(label = paste0("n = ", comma(n))),
+    vjust = 1.8,
+    color = "white",
+    size = 4
+  ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    limits = c(0, max(plot_df$progression_rate) + 0.05)
+  ) +
+  labs(
+    title = "Mx Trails Qx in Progression",
+    subtitle = "Qx leads progress at a meaningfully higher rate than Mx leads",
+    x = NULL,
+    y = "Progression rate"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+```{r}
+plot(glm_roc, col = "#4E79A7", lwd = 2, main = "ROC Curve Comparison")
+lines(lasso_roc, col = "#F28E2B", lwd = 2)
+lines(rf_roc, col = "#59A14F", lwd = 2)
+lines(xgb_roc, col = "#E15759", lwd = 2)
+
+legend("bottomright",
+       legend = c(
+         paste0("Logistic (AUC = ", round(auc(glm_roc), 3), ")"),
+         paste0("LASSO (AUC = ", round(auc(lasso_roc), 3), ")"),
+         paste0("RF (AUC = ", round(auc(rf_roc), 3), ")"),
+         paste0("XGB (AUC = ", round(auc(xgb_roc), 3), ")")
+       ),
+       col = c("#4E79A7", "#F28E2B", "#59A14F", "#E15759"),
+       lwd = 2)
+```
+
+```{r}
+ggplot(gains_df, aes(x = pct_leads, y = pct_progressed_captured)) +
+  geom_line(size = 1.2, color = "#2C7FB8") +
+  geom_point(size = 2, color = "#2C7FB8") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Gains Chart: Model Effectiveness",
+    subtitle = "Model significantly outperforms random targeting",
+    x = "Proportion of Leads Targeted",
+    y = "Proportion of Progressed Leads Captured"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+```{r}
+library(tidyverse)
+library(scales)
+
+threshold_results <- tibble(
+  threshold = c(0.25, 0.30, 0.50),
+  TN = c(1766, 1944, 2339),
+  FP = c(612, 434, 39),
+  FN = c(189, 258, 561),
+  TP = c(440, 371, 68),
+  sensitivity = c(0.700, 0.590, 0.108),
+  specificity = c(0.743, 0.817, 0.984),
+  precision = c(0.418, 0.461, 0.636),
+  accuracy = c(0.734, 0.770, 0.800)
+)
+
+sens_spec_long <- threshold_results %>%
+  select(threshold, sensitivity, specificity) %>%
+  pivot_longer(
+    cols = c(sensitivity, specificity),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(metric = recode(metric,
+    sensitivity = "Sensitivity",
+    specificity = "Specificity"
+  ))
+
+ggplot(sens_spec_long, aes(x = threshold, y = value, color = metric)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_text(
+    aes(label = percent(value, accuracy = 1)),
+    vjust = -0.8,
+    size = 4,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(breaks = threshold_results$threshold) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(
+    title = "Sensitivity vs Specificity by Decision Threshold",
+    subtitle = "Lower thresholds capture more progressed leads, while higher thresholds reduce false positives",
+    x = "Decision threshold",
+    y = "Metric value",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 24)
+```
+
+```{r}
+thresholds <- seq(0.10, 0.50, by = 0.05)
+
+library(dplyr)
+library(purrr)
+library(tibble)
+
+thresholds <- seq(0.10, 0.50, by = 0.05)
+
+actual <- as.numeric(y_test)
+actual <- ifelse(actual > 0, 1, 0)
+
+threshold_metrics <- map_dfr(thresholds, function(thresh) {
+  
+  preds <- ifelse(lasso_probs >= thresh, 1, 0)
+  
+  tibble(
+    threshold = thresh,
+    TN = sum(preds == 0 & actual == 0),
+    FP = sum(preds == 1 & actual == 0),
+    FN = sum(preds == 0 & actual == 1),
+    TP = sum(preds == 1 & actual == 1)
+  )
+})
+
+threshold_metrics
+```
+
+```{r}
+library(scales)
+
+threshold_value_tbl <- threshold_metrics %>%
+  mutate(
+    leads_prioritized = TP + FP,
+    conversion_rate = TP / leads_prioritized,
+    capture_rate = TP / (TP + FN),
+    value_per_progression = 25000,
+    cost_per_worked_lead = 300,
+    gross_value = TP * value_per_progression,
+    work_cost = leads_prioritized * cost_per_worked_lead,
+    expected_net_value = gross_value - work_cost
+  )
+
+threshold_value_tbl
+```
+
+```{r}
+slide_table <- threshold_value_tbl %>%
+  transmute(
+    Threshold = threshold,
+    `Leads Prioritized` = leads_prioritized,
+    `Conversion Rate` = percent(conversion_rate, accuracy = 0.1),
+    `Progressions Captured` = TP,
+    `Capture Rate` = percent(capture_rate, accuracy = 0.1),
+    `Expected Net Value` = dollar(expected_net_value)
+  )
+
+slide_table
+```
+
+```{r}
+objs <- ls()
+
+df_info <- data.frame(
+  object = objs,
+  class = sapply(objs, function(x) class(get(x))[1]),
+  nrow = sapply(objs, function(x) {
+    obj <- get(x)
+    if (is.data.frame(obj) || is.matrix(obj)) nrow(obj) else NA
+  }),
+  ncol = sapply(objs, function(x) {
+    obj <- get(x)
+    if (is.data.frame(obj) || is.matrix(obj)) ncol(obj) else NA
+  })
+)
+
+df_info[order(df_info$nrow), ]
+```
+
+```{r}
+library(dplyr)
+
+test_original <- qal_model[-train_index, ]
+
+nrow(test_original)
+length(lasso_probs)
+
+df_scored <- test_original %>%
+  mutate(pred_score = lasso_probs)
+
+high_score <- df_scored %>%
+  filter(pred_score >= 0.25)
+
+names(df_scored)
+```
+
+```{r}
+industry_lift <- df_scored %>%
+  count(acct_target_industry, name = "all_leads") %>%
+  left_join(
+    high_score %>%
+      count(acct_target_industry, name = "high_score_leads"),
+    by = "acct_target_industry"
+  ) %>%
+  mutate(
+    high_score_leads = dplyr::coalesce(high_score_leads, 0L),
+    all_pct = all_leads / sum(all_leads),
+    high_pct = high_score_leads / sum(high_score_leads),
+    lift = high_pct / all_pct
+  ) %>%
+  filter(all_leads >= 30) %>%
+  arrange(desc(lift))
+
+industry_lift
+```
+
+```{r}
+size_lift <- df_scored %>%
+  count(acct_tier_rollup, name = "all_leads") %>%
+  left_join(
+    high_score %>%
+      count(acct_tier_rollup, name = "high_score_leads"),
+    by = "acct_tier_rollup"
+  ) %>%
+  mutate(
+    high_score_leads = dplyr::coalesce(high_score_leads, 0L),
+    all_pct = all_leads / sum(all_leads),
+    high_pct = high_score_leads / sum(high_score_leads),
+    lift = high_pct / all_pct
+  ) %>%
+  filter(all_leads >= 30) %>%
+  arrange(desc(lift))
+
+size_lift
+```
+
+```{r}
+seniority_lift <- df_scored %>%
+  count(seniority, name = "all_leads") %>%
+  left_join(
+    high_score %>%
+      count(seniority, name = "high_score_leads"),
+    by = "seniority"
+  ) %>%
+  mutate(
+    high_score_leads = dplyr::coalesce(high_score_leads, 0L),
+    all_pct = all_leads / sum(all_leads),
+    high_pct = high_score_leads / sum(high_score_leads),
+    lift = high_pct / all_pct
+  ) %>%
+  filter(all_leads >= 30) %>%
+  arrange(desc(lift))
+
+seniority_lift
+```
+
+```{r}
+mfg_lift <- df_scored %>%
+  count(acct_manufacturing_model, name = "all_leads") %>%
+  left_join(
+    high_score %>%
+      count(acct_manufacturing_model, name = "high_score_leads"),
+    by = "acct_manufacturing_model"
+  ) %>%
+  mutate(
+    high_score_leads = dplyr::coalesce(high_score_leads, 0L),
+    all_pct = all_leads / sum(all_leads),
+    high_pct = high_score_leads / sum(high_score_leads),
+    lift = high_pct / all_pct
+  ) %>%
+  filter(all_leads >= 30) %>%
+  arrange(desc(lift))
+
+mfg_lift
+```
+
+```{r}
+library(dplyr)
+library(purrr)
+
+thresholds <- c(0.10, 0.20, 0.25, 0.30, 0.40, 0.50)
+
+# Convert actuals
+actual_binary <- ifelse(test_data$advanced_progression == "Yes", 1, 0)
+
+confusion_by_threshold <- map_dfr(thresholds, function(thresh) {
+  
+  pred_binary <- ifelse(lasso_probs >= thresh, 1, 0)
+  
+  TP <- sum(pred_binary == 1 & actual_binary == 1, na.rm = TRUE)
+  TN <- sum(pred_binary == 0 & actual_binary == 0, na.rm = TRUE)
+  FP <- sum(pred_binary == 1 & actual_binary == 0, na.rm = TRUE)
+  FN <- sum(pred_binary == 0 & actual_binary == 1, na.rm = TRUE)
+  
+  tibble(
+    threshold = thresh,
+    TN = TN,
+    FP = FP,
+    FN = FN,
+    TP = TP,
+    sensitivity = round(TP / (TP + FN), 3),
+    specificity = round(TN / (TN + FP), 3),
+    precision   = round(TP / (TP + FP), 3),
+    accuracy    = round((TP + TN) / (TP + TN + FP + FN), 3),
+    leads_prioritized = TP + FP,
+    estimated_value = (TP * 25000) - ((TP + FP) * 300)
+  )
+})
+
+confusion_by_threshold
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
