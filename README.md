@@ -101,5 +101,5 @@ The data used in this project were provided for academic purposes and are not in
 ## Team
 
 - Miles McCunniff (@McMiles2000)
-- Sebastian (@username)
-- Jeffrey (@username)
+- Sebastian Perez Parra
+- Jeffrey Zhang
